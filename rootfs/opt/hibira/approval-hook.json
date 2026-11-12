@@ -1,0 +1,8 @@
+{
+  "always": [
+    "^(curl|wget)\\s(?!.*(localhost|127\\.0\\.0\\.1))(?=.*(\\s-X\\s*(POST|PUT|PATCH|DELETE)\\b|\\s--request[= ](POST|PUT|PATCH|DELETE)\\b|\\s(-d|--data|--data-raw|--data-binary|--json|-F|--form)\\s))(?!.*(/_search|/_count|/_msearch|/_query|/_sql|/api/ds/query|/api/v1/query|/api/v1/query_range|/loki/api/v1/query))",
+    "^docker\\s+(rm|stop|kill|restart|rmi|volume\\s+rm|network\\s+rm|system\\s+prune|container\\s+(rm|stop|kill|restart|prune))\\b",
+    "^systemctl\\s+(stop|restart|disable|mask|kill)\\b",
+    "\\b(sed\\s+-i|tee|mv|cp|rm|truncate|chmod|ln)\\b.*(config\\.yaml|shell-hooks-allowlist\\.json|\\.config/hibira)|>>?\\s*\\S*(config\\.yaml|shell-hooks-allowlist\\.json|\\.config/hibira)"
+  ]
+}

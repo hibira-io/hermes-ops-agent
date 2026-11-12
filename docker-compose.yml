@@ -1,0 +1,20 @@
+# Hermes Ops Agent with Hibira Approvals.
+#
+#   cp .env.example .env      # add your model key, chat platform and credentials
+#   docker compose up -d
+#   docker compose exec agent mcp-approval-gate login   # connect to an Approvals workspace once
+#
+# Everything the agent keeps (config, sessions, memories, skills, sign-ins)
+# lives in ./data, so upgrading the image keeps it.
+services:
+  agent:
+    image: ghcr.io/hibira-io/hermes-ops-agent:latest
+    container_name: hermes-ops-agent
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+    volumes:
+      - ./data:/opt/data
+    command: ["gateway", "run"]

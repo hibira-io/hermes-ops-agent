@@ -1,0 +1,341 @@
+#!/opt/hermes/.venv/bin/python
+"""Wire Hibira Approvals into a Hermes home.
+
+Runs at every container start (and by hand: `hibira-setup --print`). It only
+touches what it manages:
+
+- hooks.pre_tool_call: the `terminal` tool goes through `mcp-approval-gate hook hermes`
+- shell-hooks-allowlist.json: consent for that one hook command
+- mcp_servers: one entry per module whose environment is set, each wrapped by
+  the approval gate (reads pass, changes wait for approval)
+- terminal.env_passthrough: the cloud credentials of the cloud modules that are on
+  (AWS, Cloudflare), so `aws` and `wrangler` work from the terminal tool
+- gcloud: activates GCP_SERVICE_ACCOUNT_JSON (or GOOGLE_APPLICATION_CREDENTIALS)
+- model: HERMES_MODEL / HERMES_PROVIDER / HERMES_BASE_URL when set
+- skills/hibira-approvals and ~/.config/hibira/approval-hook.json defaults
+
+Everything else in config.yaml is left as the user wrote it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
+
+HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+CONFIG = HOME / "config.yaml"
+ALLOWLIST = HOME / "shell-hooks-allowlist.json"
+STATE = HOME / ".hibira" / "managed.json"
+SHARE = Path("/opt/hibira")
+
+HOOK_COMMAND = "mcp-approval-gate hook hermes"
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
+
+# Passed to every gated MCP server, so the gate can reach Approvals.
+GATE_ENV = ["HIBIRA_APPROVALS_TOKEN", "HIBIRA_APPROVALS_URL", "HIBIRA_APP_ID", "HIBIRA_KEY", "HIBIRA_SECRET",
+            "HIBIRA_API_URL", "GATE_APPROVERS", "GATE_EXPIRES_MINUTES", "GATE_PUSH_INTERESTS", "GATE_CHANNEL"]
+
+
+def env(name: str) -> str:
+    return os.environ.get(name, "").strip()
+
+
+def is_off(name: str) -> bool:
+    return env(name).lower() in {"0", "off", "false", "no"}
+
+
+def gated(label: str, upstream: list[str], env_names: list[str], extra_env: dict[str, str] | None = None,
+          gate_args: list[str] | None = None) -> CommentedMap:
+    """An mcp_servers entry: the approval gate in front of a stdio MCP server."""
+    entry = CommentedMap()
+    entry["command"] = "mcp-approval-gate"
+    entry["args"] = CommentedSeq(["--label", label, *(gate_args or []), *(["--", *upstream] if upstream else [])])
+    server_env = CommentedMap()
+    for name in [*env_names, *GATE_ENV]:
+        # Hermes drops an entry whose variable is unset, so optional ones are safe.
+        server_env[name] = "${" + name + "}"
+    for k, v in (extra_env or {}).items():
+        server_env[k] = v
+    entry["env"] = server_env
+    entry["timeout"] = 120
+    return entry
+
+
+def modules() -> dict[str, CommentedMap]:
+    """The MCP modules turned on by the environment."""
+    out: dict[str, CommentedMap] = {}
+    if env("GRAFANA_URL") and not is_off("HIBIRA_MODULE_GRAFANA"):
+        out["grafana"] = gated(
+            "Grafana",
+            ["mcp-grafana"],
+            ["GRAFANA_URL", "GRAFANA_SERVICE_ACCOUNT_TOKEN", "GRAFANA_USERNAME", "GRAFANA_PASSWORD", "GRAFANA_ORG_ID"],
+            {"GRAFANA_USAGE_STATS": "disabled"},
+        )
+    if env("ES_URL") and not is_off("HIBIRA_MODULE_ELASTICSEARCH"):
+        out["elasticsearch"] = gated(
+            "Elasticsearch",
+            ["elasticsearch-core-mcp-server", "stdio"],
+            ["ES_URL", "ES_API_KEY", "ES_USERNAME", "ES_PASSWORD", "ES_SSL_SKIP_VERIFY"],
+        )
+    if env("KIBANA_URL") and env("KIBANA_API_KEY") and not is_off("HIBIRA_MODULE_KIBANA"):
+        # Elastic 9.2+ Agent Builder MCP endpoint (includes custom Agent Builder tools).
+        out["kibana"] = gated(
+            "Kibana",
+            [],
+            ["KIBANA_URL", "KIBANA_API_KEY"],
+            {"GATE_UPSTREAM_URL": "${KIBANA_URL}/api/agent_builder/mcp",
+             "GATE_UPSTREAM_HEADERS": "Authorization: ApiKey ${KIBANA_API_KEY}"},
+        )
+    if env("PROMETHEUS_URL") and not is_off("HIBIRA_MODULE_PROMETHEUS"):
+        out["prometheus"] = gated(
+            "Prometheus",
+            ["prometheus-mcp-server"],
+            ["PROMETHEUS_URL", "PROMETHEUS_USERNAME", "PROMETHEUS_PASSWORD", "PROMETHEUS_TOKEN",
+             "PROMETHEUS_URL_SSL_VERIFY", "ORG_ID"],
+        )
+    if env("DATABASE_URL") and not is_off("HIBIRA_MODULE_DATABASE"):
+        out["database"] = gated(
+            env("DATABASE_LABEL") or "Database",
+            ["dbhub", "--transport", "stdio"],
+            [],
+            {"DSN": "${DATABASE_URL}"},
+        )
+    return out
+
+
+CLOUD_ENV = {
+    "aws": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION",
+            "AWS_DEFAULT_REGION", "AWS_PROFILE"],
+    "cloudflare": ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"],
+    "gcp": ["CLOUDSDK_CORE_PROJECT"],
+}
+
+
+def cloud_modules() -> list[str]:
+    """Cloud CLIs the agent can use, turned on by their credentials."""
+    on = []
+    if (env("AWS_ACCESS_KEY_ID") or env("AWS_PROFILE") or (HOME / ".aws").is_dir()) and not is_off("HIBIRA_MODULE_AWS"):
+        on.append("aws")
+    if (env("GCP_SERVICE_ACCOUNT_JSON") or env("GOOGLE_APPLICATION_CREDENTIALS")
+            or (Path(env("CLOUDSDK_CONFIG") or HOME / ".config" / "gcloud") / "credentials.db").exists()) and not is_off("HIBIRA_MODULE_GCP"):
+        on.append("gcp")
+    if env("CLOUDFLARE_API_TOKEN") and not is_off("HIBIRA_MODULE_CLOUDFLARE"):
+        on.append("cloudflare")
+    return on
+
+
+def apply_cloud(cfg: CommentedMap, state: dict) -> list[str]:
+    on = cloud_modules()
+    terminal = cfg.get("terminal")
+    if not isinstance(terminal, CommentedMap):
+        terminal = CommentedMap()
+    current = terminal.get("env_passthrough")
+    names = [n for n in (current if isinstance(current, list) else []) if n not in state.get("env_passthrough", [])]
+    added = []
+    for mod in on:
+        for name in CLOUD_ENV[mod]:
+            if name not in names and name not in added:
+                added.append(name)
+    names.extend(added)
+    if names:
+        terminal["env_passthrough"] = CommentedSeq(names)
+    elif "env_passthrough" in terminal:
+        del terminal["env_passthrough"]
+    if terminal:
+        cfg["terminal"] = terminal
+    elif "terminal" in cfg:
+        del cfg["terminal"]
+    state["env_passthrough"] = added
+    return on
+
+
+def activate_gcloud() -> str:
+    """Signs gcloud in with a service account; the result stays in ~/.config/gcloud."""
+    key = None
+    if env("GCP_SERVICE_ACCOUNT_JSON"):
+        key = Path(env("CLOUDSDK_CONFIG") or HOME / ".config" / "gcloud") / "hibira-service-account.json"
+        key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
+    elif env("GOOGLE_APPLICATION_CREDENTIALS") and Path(env("GOOGLE_APPLICATION_CREDENTIALS")).is_file():
+        key = Path(env("GOOGLE_APPLICATION_CREDENTIALS"))
+    if not key or not shutil.which("gcloud"):
+        return ""
+    run = lambda *a: subprocess.run(["gcloud", *a], capture_output=True, text=True, timeout=120)
+    res = run("auth", "activate-service-account", f"--key-file={key}")
+    if res.returncode != 0:
+        lines = [ln.strip() for ln in res.stderr.splitlines() if ln.strip()]
+        first = next((ln for ln in lines if ln.startswith("ERROR")), lines[0] if lines else "?")
+        return "gcloud sign-in failed: " + first[:200]
+    project = env("CLOUDSDK_CORE_PROJECT")
+    if not project:
+        try:
+            project = json.loads(key.read_text()).get("project_id", "")
+        except (OSError, ValueError):
+            project = ""
+    if project:
+        run("config", "set", "project", project)
+    return f"gcloud project {project}" if project else "gcloud signed in"
+
+
+def load_yaml(yaml: YAML) -> CommentedMap:
+    if CONFIG.exists():
+        data = yaml.load(CONFIG.read_text())
+        if isinstance(data, CommentedMap):
+            return data
+    return CommentedMap()
+
+
+def apply_model(cfg: CommentedMap) -> list[str]:
+    notes = []
+    model = cfg.get("model")
+    if not isinstance(model, CommentedMap):
+        model = CommentedMap()
+        cfg["model"] = model
+    if env("HERMES_MODEL"):
+        model["default"] = env("HERMES_MODEL")
+        notes.append(f"model {env('HERMES_MODEL')}")
+    if env("HERMES_PROVIDER"):
+        model["provider"] = env("HERMES_PROVIDER")
+        notes.append(f"provider {env('HERMES_PROVIDER')}")
+        if env("HERMES_PROVIDER") not in {"openrouter", "custom", "auto"} and model.get("base_url") == OPENROUTER_URL:
+            del model["base_url"]
+    if env("HERMES_BASE_URL"):
+        model["base_url"] = env("HERMES_BASE_URL")
+        if not env("HERMES_PROVIDER"):
+            model["provider"] = "custom"
+        notes.append("custom base URL")
+    return notes
+
+
+def apply_hook(cfg: CommentedMap) -> bool:
+    hooks = cfg.get("hooks")
+    if not isinstance(hooks, CommentedMap):
+        hooks = CommentedMap()
+        cfg["hooks"] = hooks
+    entries = hooks.get("pre_tool_call")
+    if not isinstance(entries, list):
+        entries = CommentedSeq()
+        hooks["pre_tool_call"] = entries
+    keep = [e for e in entries if not (isinstance(e, dict) and e.get("command") == HOOK_COMMAND)]
+    on = not is_off("HIBIRA_TERMINAL_APPROVALS")
+    if on:
+        hook = CommentedMap()
+        hook["matcher"] = "terminal"
+        hook["command"] = HOOK_COMMAND
+        hook["timeout"] = 300
+        hook["fail_closed"] = True
+        keep.insert(0, hook)
+    entries.clear()
+    entries.extend(keep)
+    if not entries:
+        del hooks["pre_tool_call"]
+    if not hooks:
+        del cfg["hooks"]
+    return on
+
+
+def apply_allowlist(on: bool) -> None:
+    data: dict = {"approvals": []}
+    if ALLOWLIST.exists():
+        try:
+            loaded = json.loads(ALLOWLIST.read_text())
+            if isinstance(loaded, dict) and isinstance(loaded.get("approvals"), list):
+                data = loaded
+        except ValueError:
+            pass
+    rest = [a for a in data["approvals"] if not (isinstance(a, dict) and a.get("command") == HOOK_COMMAND)]
+    if on:
+        rest.append({"event": "pre_tool_call", "command": HOOK_COMMAND})
+    data["approvals"] = rest
+    ALLOWLIST.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def load_state() -> dict:
+    try:
+        data = json.loads(STATE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def apply_modules(cfg: CommentedMap, state: dict) -> list[str]:
+    managed_before: list[str] = state.get("mcp_servers", [])
+    servers = cfg.get("mcp_servers")
+    if not isinstance(servers, CommentedMap):
+        servers = CommentedMap()
+    wanted = modules()
+    for name in managed_before:
+        if name not in wanted and name in servers:
+            del servers[name]
+    taken = []
+    for name, entry in wanted.items():
+        if name in servers and name not in managed_before:
+            # The user defined a server with this name: theirs wins.
+            continue
+        servers[name] = entry
+        taken.append(name)
+    if servers:
+        cfg["mcp_servers"] = servers
+    elif "mcp_servers" in cfg:
+        del cfg["mcp_servers"]
+    state["mcp_servers"] = taken
+    return taken
+
+
+def copy_defaults() -> None:
+    for skill_src in sorted((SHARE / "skills").iterdir()):
+        if skill_src.is_dir():
+            shutil.copytree(skill_src, HOME / "skills" / skill_src.name, dirs_exist_ok=True)
+    hook_settings = Path(env("HIBIRA_CONFIG_DIR") or HOME / ".config" / "hibira") / "approval-hook.json"
+    if not hook_settings.exists() and (SHARE / "approval-hook.json").exists():
+        hook_settings.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.copyfile(SHARE / "approval-hook.json", hook_settings)
+
+
+def main() -> int:
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.width = 4096
+    cfg = load_yaml(yaml)
+    notes = apply_model(cfg)
+    hook_on = apply_hook(cfg)
+    state = load_state()
+    servers = apply_modules(cfg, state)
+    clouds = apply_cloud(cfg, state)
+    if "--print" in sys.argv:
+        yaml.dump(cfg, sys.stdout)
+        return 0
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(state) + "\n")
+    tmp = CONFIG.with_suffix(".yaml.hibira-tmp")
+    with tmp.open("w") as fh:
+        yaml.dump(cfg, fh)
+    os.chmod(tmp, 0o640)
+    tmp.replace(CONFIG)
+    apply_allowlist(hook_on)
+    copy_defaults()
+    if "gcp" in clouds:
+        gcp = activate_gcloud()
+        if gcp:
+            notes.append(gcp)
+    connected = "token from HIBIRA_APPROVALS_TOKEN" if env("HIBIRA_APPROVALS_TOKEN") else (
+        "app keys from HIBIRA_APP_ID" if env("HIBIRA_APP_ID") else None) or (
+        "signed in" if (Path(env("HIBIRA_CONFIG_DIR") or HOME / ".config" / "hibira") / "approval-gate.json").exists()
+        else "not connected yet: docker exec -it <container> mcp-approval-gate login")
+    print(f"[hibira] terminal approvals: {'on' if hook_on else 'off'}; "
+          f"modules: {', '.join(servers + clouds) or 'none'}; Approvals: {connected}"
+          + (f"; {', '.join(notes)}" if notes else ""), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
