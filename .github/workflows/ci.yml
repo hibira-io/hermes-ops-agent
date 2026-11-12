@@ -24,7 +24,13 @@ jobs:
           if npm view "$want" version >/dev/null 2>&1; then
             echo "spec=$want" >> "$GITHUB_OUTPUT"
           else
-            git clone --depth 1 --branch "${GATE_REF:-main}" https://github.com/hibira-io/mcp-approval-gate /tmp/gate
+            # main until the Hermes hook lands there, then the gate's open PR branch.
+            for ref in ${GATE_REF} main claude/project-thread-uaqm61; do
+              rm -rf /tmp/gate
+              git clone -q --depth 1 --branch "$ref" https://github.com/hibira-io/mcp-approval-gate /tmp/gate || continue
+              grep -q "hermes" /tmp/gate/src/hook.js 2>/dev/null && { echo "gate from $ref"; break; }
+            done
+            grep -q "hermes" /tmp/gate/src/hook.js
             (cd /tmp/gate && npm pack --pack-destination "$GITHUB_WORKSPACE/build")
             echo "spec=/tmp/hibira-build/$(ls build | grep '\.tgz$' | head -1)" >> "$GITHUB_OUTPUT"
           fi
