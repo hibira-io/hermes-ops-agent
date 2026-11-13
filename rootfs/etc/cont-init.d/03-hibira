@@ -1,0 +1,10 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Hibira setup: runs after 01-hermes-setup has seeded $HERMES_HOME.
+# Wires Hibira Approvals into config.yaml (terminal hook + gated MCP modules)
+# on every start, so changing the environment and restarting is enough.
+set -eu
+if [ "$(id -u)" = 0 ]; then
+    exec s6-setuidgid hermes /opt/hibira/bin/hibira-setup
+fi
+exec /opt/hibira/bin/hibira-setup
