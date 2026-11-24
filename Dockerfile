@@ -18,7 +18,7 @@ ARG GRAFANA_MCP_VERSION=v2.3.0
 ARG PROMETHEUS_MCP_VERSION=1.6.2
 ARG DBHUB_VERSION=1.6.1
 # The approval gate from npm. CI can pass a local tarball instead (GATE_SPEC=/tmp/gate.tgz).
-ARG GATE_SPEC=@hibira-io/mcp-approval-gate@0.4.0
+ARG GATE_SPEC=@hibira-io/mcp-approval-gate@0.4.1
 ARG WRANGLER_VERSION=4.155.0
 ARG GCLOUD_VERSION=590.0.0
 
@@ -86,7 +86,7 @@ ENV GRAFANA_USAGE_STATS=disabled \
     CLOUDSDK_CORE_DISABLE_PROMPTS=1 \
     WRANGLER_SEND_METRICS=false \
     AWS_PAGER= \
-    HIBIRA_APPROVALS_URL=https://approvals.hibira.io \
+    HIBIRA_APPROVALS_URL=https://api.hibira.io/approvals \
     HIBIRA_CONFIG_DIR=/opt/data/.config/hibira \
     HIBIRA_STATE_DIR=/opt/data/.local/state/hibira \
     CLOUDSDK_CONFIG=/opt/data/.config/gcloud \
