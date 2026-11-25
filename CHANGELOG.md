@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- mcp-approval-gate 0.4.1; `HIBIRA_APPROVALS_URL` defaults to https://api.hibira.io/approvals (https://approvals.hibira.io keeps working).
+
 ## 0.1.0
 
 - First release: Hermes Agent v0.23.1 for ops work with Hibira Approvals built in.
